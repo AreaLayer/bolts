@@ -223,6 +223,17 @@ This is formatted according to the Type-Length-Value format defined in [BOLT #1]
         * [`point`:`public_key`]
         * [`...*byte`:`hop_payloads`]
         * [`32*byte`:`hmac`]
+    1. type: 21 (`recipient_features`)
+    2. data:
+        * [`...*byte`:`features`]
+    1. type: 22 (`recipient_blinded_paths`)
+    2. data:
+        * [`...*payment_blinded_path`:`paths`]
+
+1. subtype: `payment_blinded_path`
+2. data:
+   * [`path`:`blinded_path`]
+   * [`blinded_payinfo`:`payment_info`]
 
 `short_channel_id` is the ID of the outgoing channel used to route the
 message; the receiving peer should operate the other end of this channel.
@@ -274,6 +285,7 @@ The writer of the TLV `payload`:
       - MUST include the `blinding_point` provided by the recipient in `current_blinding_point`
     - If it is the final node:
       - MUST include `amt_to_forward`, `outgoing_cltv_value` and `total_amount_msat`.
+      - MAY include `trampoline_onion_packet`.
       - The value set for `outgoing_cltv_value`: 
         - MUST use the current block height as a baseline value. 
         - if a [random offset](07-routing-gossip.md#recommendations-for-routing) was added to improve privacy:
@@ -613,7 +625,8 @@ delegate the construction of parts of the route to trampoline nodes.
 The origin node only needs to select a set of trampoline nodes and to know a
 route to the first trampoline node. Each trampoline node is responsible for
 finding its own route to the next trampoline node. The last trampoline node
-must be the final recipient.
+must be the final recipient, or it must receive a list of blinded paths to
+which it should relay the payment.
 
 The `trampoline_onion_packet` has a variable size to allow implementations to
 choose their own trade-off between flexibility and privacy. It's recommended to
@@ -629,29 +642,85 @@ requirements contained in the onion.
 
 A sending node:
 
-- If the invoice doesn't support the `trampoline_routing` feature:
-  - MUST NOT use trampoline routing to pay that invoice
-- MUST ensure that each hop in the `trampoline_onion_packet` supports `trampoline_routing`
-- MUST encrypt the `trampoline_onion_packet` with the same construction as `onion_packet`
-- MAY add trailing filler data similar to what is done in the `onion_packet`
-- MUST use a different `session_key` for the `trampoline_onion_packet` and the `onion_packet`
-- MUST include the `trampoline_onion_packet` tlv in the _last_ hop's payload of the `onion_packet`
-- MUST include the invoice's `payment_secret` in the _last_ hop's payload of the `trampoline_onion_packet`
-- MUST generate a different `payment_secret` to use in the outer onion
+- MUST ensure that each hop in the `trampoline_onion_packet` supports `trampoline_routing`.
+- MUST encrypt the `trampoline_onion_packet` with the same construction as `onion_packet`.
+- MAY add trailing filler data similar to what is done in the `onion_packet`.
+- MUST use a different `session_key` for the `trampoline_onion_packet` and the `onion_packet`.
+- MUST include the `trampoline_onion_packet` tlv in the _last_ hop's payload of the `onion_packet`.
+- MUST generate a random `payment_secret` to use for the `onion_packet`.
+- When paying a Bolt 11 invoice:
+  - If the invoice doesn't support the `trampoline_routing` feature:
+    - MUST NOT use trampoline routing to pay that invoice.
+  - Otherwise:
+    - MUST include the invoice's `payment_secret` in the _last_ hop's payload of the `trampoline_onion_packet`.
+- When paying a Bolt 12 invoice:
+  - MUST use a single trampoline hop.
+  - SHOULD include the `trampoline_routing` feature in the `invoice_request`.
+  - If the Bolt 12 invoice supports the `trampoline_routing` feature:
+    - In the _last_ hop's payload of the `trampoline_onion_packet` (for the final recipient):
+      - MUST include `amt_to_forward` with the amount that the recipient should receive.
+      - MUST include `outgoing_cltv_value` with the minimum expiry that the recipient should receive.
+      - MAY include `total_amount_msat` if the payment is split across multiple `trampoline_onion_packet`s.
+      - MAY include additional tlv fields.
+    - In the _next-to-last_ hop's payload of the `trampoline_onion_packet` (for the trampoline node):
+      - MUST include `amt_to_forward` with the amount that should be forwarded to the recipient.
+      - MUST include `outgoing_cltv_value` with the minimum expiry that should be received by the recipient.
+    - When encrypting the `trampoline_onion_packet`:
+      - When creating the onion packet for the _final_ recipient:
+        - MUST derive an `invreq_ss` as `ECDH(invoice_request.payer_privkey, invoice_node_id)`.
+        - MUST use $`SHA256(\text{"blinded\_trampoline\_payment"} || payment\_hash || invreq\_ss)`$ as associated data for the packet's HMAC.
+  - Otherwise:
+    - MUST NOT include a payload for the final recipient in the `trampoline_onion_packet`.
+    - In the _last_ hop's payload of the `trampoline_onion_packet` (for the trampoline node):
+      - MUST include `amt_to_forward` with the amount that should be forwarded to the recipient.
+      - MUST include `outgoing_cltv_value` with the minimum expiry that should be received by the recipient.
+  - In the _last_ hop's payload of the outer `onion_packet` (for the trampoline node):
+    - MUST include blinded paths from the invoice in `recipient_blinded_paths`.
+    - MAY include features supported by the recipient in `recipient_features`.
+    - If the invoice contains too many blinded paths:
+      - MUST include a subset of those paths without overflowing the `onion_packet`.
 
 When processing a `trampoline_onion_packet`, a receiving node:
 
 - If it doesn't support `trampoline_routing`:
-  - MUST report a route failure to the origin node
+  - MUST report a route failure to the origin node.
 - Otherwise, if it supports `trampoline_routing`:
-  - MUST process the `trampoline_onion_packet` as an `onion_packet`
-  - MUST fail the HTLC if dictated by the requirements under [Failure Messages](#failure-messages)
-  - MUST compute a route to the next trampoline node
-  - MUST include the peeled `trampoline_onion_packet` in the `hop_payload` for the next trampoline node
+  - MUST process the `trampoline_onion_packet` as an `onion_packet`.
+  - If the incoming payment is a blinded payment matching an invoice it created:
+    - MUST derive an `invreq_ss` as `ECDH(invoice_privkey, invoice_request.payer_id)`.
+    - MUST use $`SHA256(\text{"blinded\_trampoline\_payment"} || payment\_hash || invreq\_ss)`$ as associated data for the packet's HMAC.
+    - If the `trampoline_routing` feature was set in the invoice:
+      - If the `hop_payload` does NOT include a `trampoline_onion_packet`:
+        - MUST fail the payment.
   - If the incoming payment is a multi-part payment:
-    - MUST wait to receive all the payment parts before forwarding
+    - MUST wait to receive all the payment parts before forwarding.
+  - MUST fail the HTLC if dictated by the requirements under [Failure Messages](#failure-messages).
+  - If the `hop_payload` from the `onion_packet` contains `recipient_blinded_paths`:
+    - MUST use those blinded paths to compute routes to the final recipient.
+    - If it is not the final hop of the `trampoline_onion_packet`:
+      - MUST include the peeled `trampoline_onion_packet` in the _last_ hop's payload of the outgoing `onion_packet`s.
+  - Otherwise:
+    - MUST compute a route to the next trampoline node.
+    - MUST include the peeled `trampoline_onion_packet` in the `hop_payload` for the next trampoline node.
   - If it uses a multi-part payment to forward to the next trampoline node:
-    - MUST generate a new `payment_secret` to use in the outer onion
+    - MUST generate a new `payment_secret` to use in the outer onion.
+
+#### Rationale
+
+When the recipient is using using Bolt 12, its identity is protected by
+blinded paths: we thus don't need to use multiple trampoline nodes to
+protect the recipient's privacy. The payer simply provides the blinded
+paths directly to its trampoline node, who will relay the payment through
+those blinded paths. Blinded paths are included in the _outer_ onion, not
+in the _trampoline_ onion, because it would otherwise unnecessarily use a
+lot of space in the outgoing onion from the trampoline node.
+
+When the recipient is using trampoline, the sender may include a payload
+for the recipient in the trampoline onion, but the trampoline node could
+replace it with a trampoline onion they created: to avoid that, we use a
+shared secret based on the `invoice_request`'s `payer_id` when we encrypt
+that payload, which guarantees that the node that created the trampoline
+onion was the node that sent `invoice_request`.
 
 # Accepting and Forwarding a Payment
 
